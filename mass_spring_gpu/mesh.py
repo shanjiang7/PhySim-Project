@@ -52,5 +52,5 @@ def generate_warp_mesh():
 
     return pos_wp, connectors_wp, len(connectors)
 
-# Call it
+# Call the function 
 pos_gpu, conn_gpu, num_connectors = generate_warp_mesh()
