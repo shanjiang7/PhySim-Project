@@ -16,27 +16,27 @@ wp.init()
 
 ### Parameters ###
 k_spring = 2.0 # Spring stiffness constant
-initial_stretch = 1.4
-h = .0004 # timestep in seconds
-rho = 1000 # density
+h = .0004 #timestep in seconds
 side_len = 1
+rho = 1000
 n_seg = 4
-seg_len = side_len / n_seg
 dim = n_seg + 1
-m = rho * side_len * side_len / (dim * dim) # calculate node mass evenly
+initial_stretch = 1.4
 
 
 
 ### Create a lattice-like square mesh of points ###
 def generate_warp_mesh(side_len, n_seg):
-    # Generate grid points, q will be a 2D vector with x and y positions
-    # pos = q = [(x1, y1), (x2, y2), (x3, y3), ..., (xn, yn)]
+    # Generate grid points, pos will be a 1D vector with x and y positions (basically q)
+    # pos = q = [x1, y1, x2, y2, x3, y3, ..., xn, yn]
+    dim = n_seg + 1
+    seg_len = side_len / n_seg
     q = []
     for i in range(dim):
         for j in range(dim):
             x = -side_len / 2 + i * seg_len
             y = -side_len / 2 + j * seg_len
-            q.append((x, y)) 
+            q.append((x, y))  
     # Convert to Warp arrays, float32 works better on gpus!
     q_np = np.array(q, dtype=np.float32)
     q_wp = wp.array(q_np, dtype=wp.vec2, device="cuda")
@@ -72,7 +72,8 @@ def generate_warp_mesh(side_len, n_seg):
 ### Calculate the Value, Gradient, and Hessian of Inertia for each point ###
 @wp.kernel
 def compute_val_inertia(q: wp.array(dtype=wp.vec2), 
-                q_next: wp.array(dtype=wp.vec2),  
+                q_next: wp.array(dtype=wp.vec2), 
+                m: wp.array(dtype=wp.float32), 
                 val_out: wp.array(dtype=wp.float32)):
     tid = wp.tid()
     diff = q[tid] - q_next[tid]
@@ -81,16 +82,18 @@ def compute_val_inertia(q: wp.array(dtype=wp.vec2),
 @wp.kernel
 def compute_grad_inertia(q: wp.array(dtype=wp.vec2), 
         q_next: wp.array(dtype=wp.vec2), 
+        m: wp.array(dtype=wp.float32), 
         grad_out: wp.array(dtype=wp.vec2)):
     tid = wp.tid()
     grad_out[tid] = m[tid]*(q[tid] - q_next[tid])
 
-def compute_hess_inertia(q, q_next):
-    n = len(q)
-    I = np.arange(n, dtype=np.int32)
-    J = np.arange(n, dtype=np.int32)
+def compute_hess_inertia(q, q_next, m):
+    n2 = len(q)
+    I = np.arange(n2, dtype=np.int32)
+    J = np.arange(n2, dtype=np.int32)
     V = np.array(m).astype(np.float32)
     return [I, J, V]
+
 
 
 ### Calculate the value, gradient and hessian of the potential energy for each edge (connector) ###
@@ -102,13 +105,14 @@ def compute_val_potential(q: wp.array(dtype=wp.vec2),
     tid = wp.tid()
     i1 = connectors[tid][0]
     i2 = connectors[tid][1]
-
-    l2 = (rest_lengths[tid])^2
+    rest_len = rest_lengths[tid]
     diff = q[i1] - q[i2]
     dist2 = wp.dot(diff, diff)
-    energy = 0.5 * l2 * k_spring * (dist2/l2 - 1)
+    dist = wp.sqrt(dist2)
 
+    energy = 0.5 * k_spring * ((dist - rest_len) * (dist - rest_len))
     wp.atomic_add(val_out, 0, energy)
+
 
 @wp.kernel
 def compute_grad_potential(q: wp.array(dtype=wp.vec2),
@@ -118,23 +122,29 @@ def compute_grad_potential(q: wp.array(dtype=wp.vec2),
     tid = wp.tid()
     i1 = connectors[tid][0]
     i2 = connectors[tid][1]
-
     rest_len = rest_lengths[tid]
-
     diff = q[i1] - q[i2]
     dist = wp.sqrt(wp.dot(diff, diff)) + 1e-8  # avoid div by zero
 
     force = k_spring * (dist - rest_len) / dist * diff
-
     wp.atomic_add(grad_out, i1, force)
     wp.atomic_add(grad_out, i2, -force)
+
+
+def make_PSD(hess):
+    [lam, V] = LA.eigh(hess)    # Eigen decomposition on symmetric matrix
+    # set all negative Eigenvalues to 0
+    for i in range(0, len(lam)):
+        lam[i] = max(0, lam[i])
+    return np.matmul(np.matmul(V, np.diag(lam)), np.transpose(V))
+
 
 def compute_hess_potential(q, connectors, rest_lengths):
     IJV = [[0] * (len(connectors) * 16), [0] * (len(connectors) * 16), np.array([0.0] * (len(connectors) * 16))]
     for i in range(0, len(connectors)):
         diff = q[connectors[i][0]] - q[connectors[i][1]]
         H_diff = 2 * k_spring / rest_lengths[i] * (2 * np.outer(diff, diff) + (diff.dot(diff) - rest_lengths[i]) * np.identity(2))
-        H_local = make_SPD(np.block([[H_diff, -H_diff], [-H_diff, H_diff]]))
+        H_local = make_PSD(np.block([[H_diff, -H_diff], [-H_diff, H_diff]]))
         # add to global matrix
         for nI in range(0, 2):
             for nJ in range(0, 2):
@@ -146,12 +156,6 @@ def compute_hess_potential(q, connectors, rest_lengths):
                         IJV[2][indStart + r * 2 + c] = H_local[nI * 2 + r, nJ * 2 + c]
     return IJV
 
-def make_SPD(hess):
-    [lam, V] = LA.eigh(hess)    # Eigen decomposition on symmetric matrix
-    # set all negative Eigenvalues to 0
-    for i in range(0, len(lam)):
-        lam[i] = max(0, lam[i])
-    return np.matmul(np.matmul(V, np.diag(lam)), np.transpose(V))
 
 
 
@@ -159,6 +163,7 @@ def make_SPD(hess):
 def IP_val(q: wp.array(dtype=wp.vec2),
            connectors: wp.array(dtype=wp.int32),
            q_next: wp.array(dtype=wp.vec2),
+           m: wp.array(dtype=float),
            rest_lengths: wp.array(dtype=float)):
     
     n = q.shape[0]
@@ -168,7 +173,7 @@ def IP_val(q: wp.array(dtype=wp.vec2),
     val_inertia = wp.zeros(1, dtype=float, device="cuda")
     val_potential = wp.zeros(1, dtype=float, device="cuda")
 
-    wp.launch(kernel=compute_val_inertia, dim=n, inputs=[q, q_next, val_inertia])
+    wp.launch(kernel=compute_val_inertia, dim=n, inputs=[q, q_next, m, val_inertia])
     wp.launch(kernel=compute_val_potential, dim=num_springs, inputs=[q, connectors, rest_lengths, val_potential])
 
     # Combine the two values (IP energy = inertia + h² * potential)
@@ -179,13 +184,13 @@ def IP_val(q: wp.array(dtype=wp.vec2),
         out[0] = val_inertia[0] + h * h * val_potential[0]
 
     wp.launch(kernel=combine, dim=1, inputs=[val_inertia, val_potential, h, val])
-    #print("val is: ", val)
     return val
 
 
 def IP_grad(q: wp.array(dtype=wp.vec2),
             connectors: wp.array(dtype=wp.int32),
             q_next: wp.array(dtype=wp.vec2),
+            m: wp.array(dtype=float),
             rest_lengths: wp.array(dtype=float)):
 
     n = q.shape[0]
@@ -195,7 +200,7 @@ def IP_grad(q: wp.array(dtype=wp.vec2),
     grad_potential = wp.zeros(n, dtype=wp.vec2, device="cuda")
     grad_total = wp.zeros(n, dtype=wp.vec2, device="cuda")
 
-    wp.launch(kernel=compute_grad_inertia, dim=n, inputs=[q, q_next, grad_inertia])
+    wp.launch(kernel=compute_grad_inertia, dim=n, inputs=[q, q_next, m, grad_inertia])
     wp.launch(kernel=compute_grad_potential, dim=num_springs, inputs=[q, connectors, rest_lengths, grad_potential])
 
     # Scale grad_potential by h^2 and add to grad_inertia
@@ -209,13 +214,12 @@ def IP_grad(q: wp.array(dtype=wp.vec2),
 
     wp.launch(kernel=combine_grad, dim=n, inputs=[grad_inertia, grad_potential, h, grad_total])
 
-    #print("grad is: ", grad_total)
     return grad_total
 
 
 
-def IP_hess(q, connectors, q_next, rest_lengths):
-    IJV_In = compute_hess_inertia(q, q_next)
+def IP_hess(q, connectors, q_next, m, rest_lengths):
+    IJV_In = compute_hess_inertia(q, q_next, m)
     IJV_MS = compute_hess_potential(q, connectors, rest_lengths)
     IJV_MS[2] *= h * h    # implicit Euler
     IJV = np.append(IJV_In, IJV_MS, axis=1)
@@ -224,21 +228,23 @@ def IP_hess(q, connectors, q_next, rest_lengths):
 
 
 
-def search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, rest_lengths_wp, rest_lengths_np):
-    projected_hess = IP_hess(q_np, connectors_np, q_next_np, rest_lengths_np)
+def search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, m_wp, m_np, rest_lengths_wp, rest_lengths_np):
+    # Compute projected Hessian (still on CPU)
+    projected_hess = IP_hess(q_np, connectors_np, q_next_np, m_np, rest_lengths_np)
 
-    grad_wp = IP_grad(q_wp, connectors_wp, q_next_wp, rest_lengths_wp)  # returns wp array
+    grad_wp = IP_grad(q_wp, connectors_wp, q_next_wp, m_wp, rest_lengths_wp)  # returns wp array
     grad_np = grad_wp.numpy()  # copy back to CPU as NumPy array
 
     reshaped_grad = grad_np.reshape(len(q_np) * 2, 1)
+
     direction = spsolve(projected_hess, -reshaped_grad)
 
+    # Reshape back to (N, 2)
     return direction.reshape(len(q_np), 2)
 
 
 
-
-def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lengths_wp, rest_lengths_np, tol):
+def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, m_wp, m_np, rest_lengths_wp, rest_lengths_np, tol):
     q_next_np = q_np + v * h     # implicit Euler predictive position
     q_next_wp = wp.array(q_next_np, dtype=wp.vec2, device="cuda")
 
@@ -248,9 +254,9 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lengths_wp, r
     iter = 0
     max_iter = 10
 
-    E_last_wp = IP_val(q_wp, connectors_wp, q_next_wp, rest_lengths_wp)
+    E_last_wp = IP_val(q_wp, connectors_wp, q_next_wp, m_wp, rest_lengths_wp)
     E_last_np = E_last_wp.numpy()[0]
-    p = search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, rest_lengths_wp, rest_lengths_np)
+    p = search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, m_wp, m_np, rest_lengths_wp, rest_lengths_np)
    
     while LA.norm(p, np.inf) / h > tol and iter < max_iter:
     #while LA.norm(p, np.inf) / h > tol:
@@ -263,12 +269,11 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lengths_wp, r
                 q_trial_np = q_np + alpha * p
                 q_trial_wp = wp.array(q_trial_np, dtype=wp.vec2, device="cuda")
 
-                E_trial_wp = IP_val(q_trial_wp, connectors_wp, q_next_wp, rest_lengths_wp)
+                E_trial_wp = IP_val(q_trial_wp, connectors_wp, q_next_wp, m_wp, rest_lengths_wp)
                 E_trial_np = E_trial_wp.numpy()[0]
 
                 if E_trial_np <= E_last_np:
                     break
-
                 alpha /= 2
                 print("E_trial is: ", E_trial_np )
                 print("alpha is: ", alpha)
@@ -278,9 +283,9 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lengths_wp, r
         q_np += alpha * p
         q_wp = wp.array(q_np, dtype=wp.vec2, device="cuda")  # Sync with updated q_np
 
-        E_last_wp = IP_val(q_wp, connectors_wp, q_next_wp, rest_lengths_wp)
+        E_last_wp = IP_val(q_wp, connectors_wp, q_next_wp, m_wp, rest_lengths_wp)
         E_last_np = E_last_wp.numpy()[0]
-        p = search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, rest_lengths_wp, rest_lengths_np)
+        p = search_dir(q_wp, q_np, connectors_wp, connectors_np, q_next_wp, q_next_np, m_wp, m_np, rest_lengths_wp, rest_lengths_np)
         iter += 1
 
 
@@ -290,11 +295,11 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lengths_wp, r
 
 
 
-
 # initialize simulation
 [q_wp, q_np, connectors_wp, connectors_np, rest_lens_wp, rest_lens_np] = generate_warp_mesh(side_len, n_seg)  # node positions and edge node indices
-
 v = np.array([[0.0, 0.0]] * len(q_wp))             # velocity
+m_np = [rho * side_len * side_len / ((dim) * (dim))] * len(q_wp)  # calculate node mass evenly
+m_wp = wp.array(m_np, dtype=wp.float32, device="cuda")  # or device="cpu"
 
 # apply initial stretch horizontally
 for i in range(0, len(q_np)):
@@ -329,6 +334,7 @@ def write_to_file(frameNum, q_np, n_seg):
 
 
 
+
 time_step = 0
 write_to_file(time_step, q_np, n_seg)
 screen = pygame.display.set_mode(resolution)
@@ -352,7 +358,7 @@ while running:
     pygame.display.flip()   # flip the display
 
     # step forward simulation and wait for screen refresh
-    [q_np, v] = step_forward(q_wp, q_np, connectors_wp, connectors_np, v, rest_lens_wp, rest_lens_np, 1e-2)
+    [q_np, v] = step_forward(q_wp, q_np, connectors_wp, connectors_np, v, m_wp, m_np, rest_lens_wp, rest_lens_np, 1e-2)
     time_step += 1
     pygame.time.wait(int(h * 1000))
     write_to_file(time_step, q_np, n_seg)
