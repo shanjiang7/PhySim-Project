@@ -296,7 +296,7 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, m_wp, m_np, rest_l
 
     # Newton loop
     iter = 0
-    max_iter = 20
+    max_iter = 10
 
     E_last_wp = IP_val(q_wp, connectors_wp, q_next_wp, m_wp, rest_lengths_wp)
     E_last_np = E_last_wp.numpy()[0]
@@ -304,13 +304,14 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, m_wp, m_np, rest_l
    
     while LA.norm(p, np.inf) / h > tol and iter < max_iter:
     #while LA.norm(p, np.inf) / h > tol:
+        print('residual =', LA.norm(p, inf) / h)
         print('Iteration', iter, ':')
         print("p is: ", p)
-        print('residual =', LA.norm(p, inf) / h)
+        
 
         alpha = 1
-        q_trial_np = q_np + alpha * p
-        q_trial_wp = wp.array(q_trial_np, dtype=wp.vec2, device="cuda")
+        #q_trial_np = q_np + alpha * p
+        #q_trial_wp = wp.array(q_trial_np, dtype=wp.vec2, device="cuda")
 
         while True: 
                 q_trial_np = q_np + alpha * p
@@ -322,9 +323,11 @@ def step_forward(q_wp, q_np, connectors_wp, connectors_np, v, m_wp, m_np, rest_l
                 if E_trial_np <= E_last_np:
                     break
                 alpha /= 2
+                print("E_trial is: ", E_trial_np )
+                print("alpha is: ", alpha)
 
         print("we have officially exited the SECOND loop!")
-
+        print("we are updating q_np by ", alpha*p)
         q_np += alpha * p
         q_wp = wp.array(q_np, dtype=wp.vec2, device="cuda")  # Sync with updated q_np
 
